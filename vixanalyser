@@ -1,0 +1,194 @@
+from fastapi import FastAPI, HTTPException
+from datetime import datetime, timedelta
+import yfinance as yf
+import pandas as pd
+import numpy as np
+from fastapi.middleware.cors import CORSMiddleware
+
+app = FastAPI()
+
+# Enable CORS
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+class VIXAnalyzer:
+    def __init__(self):
+        self.df = None
+    
+    async def fetch_data(self, days=365):
+        """Fetch VIX data from Yahoo Finance"""
+        end_date = datetime.now()
+        start_date = end_date - timedelta(days=days)
+        
+        try:
+            # Download data
+            data = yf.Ticker("^VIX")
+            hist = data.history(start=start_date, end=end_date)
+            
+            # Create clean DataFrame
+            self.df = pd.DataFrame({
+                'date': hist.index,
+                'value': hist['Close'].values
+            })
+            
+            # Ensure proper data types
+            self.df['date'] = pd.to_datetime(self.df['date'])
+            self.df['value'] = pd.to_numeric(self.df['value'])
+            
+            # Sort by date and reset index
+            self.df = self.df.sort_values('date').reset_index(drop=True)
+            
+            # Calculate metrics
+            self._calculate_metrics()
+            
+            return True
+            
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"Error fetching data: {str(e)}")
+    
+    def _calculate_metrics(self):
+        """Calculate various metrics for analysis"""
+        if self.df is None or len(self.df) == 0:
+            return
+            
+        # Calculate moving averages
+        self.df['5d_ma'] = self.df['value'].rolling(window=5, min_periods=1).mean()
+        self.df['20d_ma'] = self.df['value'].rolling(window=20, min_periods=1).mean()
+        
+        # Calculate daily changes
+        self.df['daily_change'] = self.df['value'].diff()
+        self.df['percent_change'] = self.df['value'].pct_change() * 100
+        
+        # Calculate 30-day statistics if enough data exists
+        if len(self.df) >= 30:
+            self.df['30d_mean'] = self.df['value'].rolling(window=30).mean()
+            self.df['30d_std'] = self.df['value'].rolling(window=30).std()
+            self.df['z_score'] = (self.df['value'] - self.df['30d_mean']) / self.df['30d_std']
+    
+    async def get_current_analysis(self):
+        """Get analysis of the most recent VIX data"""
+        if self.df is None or len(self.df) == 0:
+            if not await self.fetch_data():
+                raise HTTPException(status_code=500, detail="No data available")
+        
+        latest = self.df.iloc[-1]
+        prev_day = self.df.iloc[-2] if len(self.df) > 1 else None
+        
+        analysis = {
+            'date': latest['date'].strftime('%Y-%m-%d'),
+            'current_vix': round(latest['value'], 2),
+            'interpretation': self._interpret_vix_level(latest['value'])
+        }
+        
+        if prev_day is not None and not pd.isna(prev_day['value']):
+            analysis.update({
+                'change': round(latest['value'] - prev_day['value'], 2),
+                'percent_change': round(((latest['value'] - prev_day['value']) / prev_day['value']) * 100, 2),
+                'trend': 'up' if latest['value'] > prev_day['value'] else 'down'
+            })
+        
+        if 'z_score' in self.df.columns and not pd.isna(latest['z_score']):
+            analysis.update({
+                '30_day_mean': round(self.df['30d_mean'].iloc[-1], 2),
+                '30_day_std': round(self.df['30d_std'].iloc[-1], 2),
+                'z_score': round(latest['z_score'], 2),
+                'percentile_30d': round((self.df['value'].tail(30) < latest['value']).mean() * 100, 1),
+                'volatility_interpretation': self._interpret_z_score(latest['z_score'])
+            })
+        
+        analysis['ma_crossover'] = self._check_ma_crossover()
+        
+        return analysis
+    
+    def _interpret_vix_level(self, value):
+        """Interpret absolute VIX level"""
+        if value < 12: return "Low volatility - complacent market"
+        elif 12 <= value < 20: return "Normal volatility"
+        elif 20 <= value < 30: return "Elevated volatility - caution advised"
+        else: return "High volatility - fearful market"
+    
+    def _interpret_z_score(self, z_score):
+        """Interpret statistical significance"""
+        if z_score > 2: return "Extremely high volatility relative to recent history"
+        elif z_score > 1: return "Significantly high volatility"
+        elif z_score < -2: return "Extremely low volatility relative to recent history"
+        elif z_score < -1: return "Significantly low volatility"
+        else: return "Volatility within normal range relative to recent history"
+    
+    def _check_ma_crossover(self):
+        """Check for moving average crossovers"""
+        if len(self.df) < 2 or '5d_ma' not in self.df.columns or '20d_ma' not in self.df.columns:
+            return "no crossover data available"
+            
+        latest = self.df.iloc[-1]
+        prev_day = self.df.iloc[-2]
+        
+        if pd.isna(latest['5d_ma']) or pd.isna(latest['20d_ma']):
+            return "insufficient data for crossover analysis"
+        
+        if latest['5d_ma'] > latest['20d_ma'] and prev_day['5d_ma'] <= prev_day['20d_ma']:
+            return "golden cross (bullish signal)"
+        elif latest['5d_ma'] < latest['20d_ma'] and prev_day['5d_ma'] >= prev_day['20d_ma']:
+            return "death cross (bearish signal)"
+        else:
+            return "no significant crossover"
+
+vix_analyzer = VIXAnalyzer()
+
+@app.get("/vix/current")
+async def get_current_vix():
+    """Get current VIX analysis"""
+    try:
+        analysis = await vix_analyzer.get_current_analysis()
+        return {
+            "success": True,
+            "data": analysis,
+            "message": "VIX data retrieved successfully"
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/vix/history")
+async def get_vix_history(days: int = 30):
+    """Get historical VIX data"""
+    try:
+        if vix_analyzer.df is None:
+            await vix_analyzer.fetch_data(max(days, 365))
+        
+        history = vix_analyzer.df.tail(days).to_dict(orient='records')
+        
+        return {
+            "success": True,
+            "data": history,
+            "message": f"VIX history for last {days} days retrieved successfully"
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/vix/analysis")
+async def get_full_analysis(days: int = 365):
+    """Get comprehensive VIX analysis"""
+    try:
+        await vix_analyzer.fetch_data(days)
+        analysis = await vix_analyzer.get_current_analysis()
+        history = vix_analyzer.df.tail(90).to_dict(orient='records')
+        
+        return {
+            "success": True,
+            "data": {
+                "current_analysis": analysis,
+                "recent_history": history
+            },
+            "message": "Complete VIX analysis retrieved successfully"
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=8000)
